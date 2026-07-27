@@ -28,7 +28,7 @@ Then edit it and check it:
 npx @transitrix/cli validate raci/raci.blocks.transitrix.yaml --template raci
 ```
 
-Requires `@transitrix/cli` **2.2.0 or newer** — the `--template` flag is not in 2.1.0.
+Requires `@transitrix/cli` 2.2.0 or newer. The `--template` flag is what runs the template's own rule — plain `validate` only checks the matrix is well-formed.
 
 Each template's own README explains its structure and the rule it applies.
 

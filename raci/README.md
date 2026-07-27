@@ -13,9 +13,16 @@ A forkable RACI — who is **R**esponsible / **A**ccountable / **C**onsulted / *
    npx @transitrix/cli validate raci.blocks.transitrix.yaml --template raci
    ```
 
-   (Windows PowerShell: `npx.cmd`.) Break the rule on purpose — give a row two `A`s, or none — and the validator fails it. That is the check working.
+   (Windows PowerShell: `npx.cmd`.) Break the rule on purpose — give a row two `A`s, or none — and it fails, naming the row:
 
-   > **Requires `@transitrix/cli` 2.2.0 or newer.** The `--template raci` flag is not in 2.1.0; on an older version the command exits with an unknown-option error rather than checking anything.
+   ```
+   ✗ RACI-001  Row "Propose a change" (ACT-PROPOSE) must have exactly one
+               column assigned "A" (Accountable); found 2
+   ```
+
+   It exits non-zero, so it works as a CI step. Requires `@transitrix/cli` 2.2.0 or newer.
+
+   ⚠️ **The `--template raci` flag is what runs the rule.** Plain `validate` checks the matrix is well-formed — unique ids, every `assign` key pointing at a declared column — but says nothing about how many `A`s a row has, because the base notation deliberately does not fix what the letters mean. Without the flag, a two-`A` row passes.
 
 ## The layout convention
 
