@@ -6,31 +6,33 @@ Each template is a self-contained file. Take one, edit it, run the validator. No
 
 ## Templates
 
-| Template | What it is | Rule it enforces |
+| Template | What it is | Shape |
 |---|---|---|
-| [`raci/`](raci/) | A RACI matrix — who is Responsible / Accountable / Consulted / Informed across a set of activities | Exactly one **A** per activity |
+| [`raci/`](raci/) | A RACI matrix — who is Responsible / Accountable / Consulted / Informed across a set of activities. Enforces the one rule that makes it a RACI: exactly one **A** per activity | one file |
+| [`operating-model/`](operating-model/) | A starter kit making a claim: "your operating model" is not a separate artefact to author, it is a composition of building blocks you already express — goals, capabilities, value streams, processes, organisation, information, products, applications. One minimal scenario runs through all eight, cross-referenced by real IDs | a small `canon/` tree |
 
 ## Grab one
 
-The whole point is that you take a single file, not a framework.
+Take what you need — one file or one folder, not a framework.
 
 ```sh
-# just the RACI template
 npx degit transitrix/templates/raci raci
-
-# or clone the lot (it is deliberately small)
-git clone https://github.com/transitrix/templates.git
+npx degit transitrix/templates/operating-model operating-model
 ```
 
 Then edit it and check it:
 
 ```sh
+# single-file template: the --template flag runs its own rule
 npx @transitrix/cli validate raci/raci.blocks.transitrix.yaml --template raci
+
+# folder template: validate the whole set from inside it
+cd operating-model && npx @transitrix/cli validate --scope=repo
 ```
 
-Requires `@transitrix/cli` 2.2.0 or newer. The `--template` flag is what runs the template's own rule — plain `validate` only checks the matrix is well-formed.
+Requires `@transitrix/cli` 2.2.0 or newer. For `raci`, the `--template` flag is what runs the one-Accountable rule — plain `validate` only checks the matrix is well-formed.
 
-Each template's own README explains its structure and the rule it applies.
+Each template's own README explains its structure and the conventions it applies.
 
 ## Why text
 
