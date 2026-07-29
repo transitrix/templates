@@ -1,0 +1,85 @@
+name: Public-surface hygiene
+
+# A public repository never points at the private hub. The slug lives only in
+# the HYGIENE_HUB_SLUG repository secret, so this file does not name it and its
+# own diff cannot trip the scan. Matched text is never printed — path only.
+#
+# Two passes, because they catch different things: the diff pass fails the
+# change under review; the full-tree pass catches whatever landed before this
+# guard existed, which a diff scan cannot see by construction.
+#
+# Also runs on push to main, so a direct commit is covered — a guard that only
+# runs on pull requests is one merge path away from being bypassed.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  hub-pointer-scan:
+    runs-on: ubuntu-latest
+    name: Hub-pointer scan (diff + full tree)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan tracked files and the PR diff
+        env:
+          HUB: ${{ secrets.HYGIENE_HUB_SLUG }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${HUB:-}" ]; then
+            echo "slug not configured; scanning the cross-ref form only."
+            PATTERN='strategy#[0-9]'
+          else
+            PATTERN="${HUB}|strategy#[0-9]"
+          fi
+
+          fail=0
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            case "$f" in .github/workflows/public-surface-hygiene.yml) continue ;; esac
+            if grep -Iqi -E "$PATTERN" "$f" 2>/dev/null; then
+              echo "::error file=$f::Private-hub pointer in a tracked file. Reference the hub as HUB-<number>."
+              fail=1
+            fi
+          done < <(git ls-files)
+
+          if [ -n "${BASE_SHA:-}" ] && [ -n "${HEAD_SHA:-}" ]; then
+            if git diff "$BASE_SHA" "$HEAD_SHA" -- . ':(exclude).github/workflows/public-surface-hygiene.yml' \
+                 | grep -E '^\+[^+]' | grep -Eqi "$PATTERN"; then
+              echo "::error::Private-hub pointer in an added diff line."
+              fail=1
+            fi
+          fi
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::public-surface-hygiene: hub-pointer scan failed. Matched terms are deliberately not printed."
+            exit 1
+          fi
+          echo "public-surface-hygiene: hub-pointer scan clean."
+
+  agent-doc-ban:
+    runs-on: ubuntu-latest
+    name: Internal-ops filename ban
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ban CLAUDE.md / AGENTS.md
+        run: |
+          set -euo pipefail
+          if git ls-files | grep -qiE '(^|/)(CLAUDE|AGENTS)\.md$'; then
+            echo "::error::CLAUDE.md / AGENTS.md are maintainer-local and must never be committed here."
+            exit 1
+          fi
+          echo "no internal-ops agent docs committed."
