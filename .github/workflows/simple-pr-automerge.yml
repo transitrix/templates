@@ -1,0 +1,284 @@
+name: Simple PR auto-merge (reusable)
+
+# Reusable workflow: evaluates every open pull request in the calling
+# repository against a fixed, deterministic checklist and auto-merges the
+# ones that qualify as trivial documentation/config-doc changes. Everything
+# below is plain shell + `gh`/`jq` reading JSON fields the GitHub CLI already
+# exposes - there is no external call, no secret, and no judgement involved.
+#
+# This file only runs when explicitly invoked with `uses:` (workflow_call).
+# It carries no trigger of its own, so simply living in this repository
+# grants no other repository the ability to call it - each caller has to add
+# its own workflow file that references this one by path. As defense in
+# depth, the runtime also checks the caller's own repository against a fixed
+# allow-list below, independent of which caller workflow files happen to
+# exist anywhere.
+#
+# The checklist, in order, mirrors nine independent yes/no questions. Any
+# "no" means the PR is not touched this run - it is left for a human,
+# logged, and nothing about it changes. When a file's category is unclear
+# the answer defaults to "no" (fail closed): an unattended merge gate is
+# only safe if "I'm not sure" always resolves to "leave it alone".
+
+on:
+  workflow_call:
+    inputs:
+      dry_run:
+        description: >-
+          When true (default), only log what each PR would receive - no
+          merge, no branch delete, no label change.
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    name: Evaluate open PRs
+    steps:
+      - name: Walk the checklist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          # --- allow-list (defense in depth) ------------------------------
+          # A repository not listed here gets nothing done, full stop, even
+          # if it somehow manages to invoke this workflow.
+          ALLOWED_REPOS=(
+            "transitrix/methodology"
+            "transitrix/transitrix-studio"
+            "transitrix/transitrix.github.io"
+          )
+          allowed=false
+          for r in "${ALLOWED_REPOS[@]}"; do
+            if [ "$r" = "$REPO" ]; then allowed=true; fi
+          done
+          if [ "$allowed" != "true" ]; then
+            echo "::error::$REPO is not on the allow-list for this workflow. Refusing to evaluate anything."
+            exit 1
+          fi
+
+          echo "Evaluating open PRs in $REPO (dry_run=$DRY_RUN)"
+
+          DEFAULT_BRANCH="$(gh repo view "$REPO" --json defaultBranchRef -q .defaultBranchRef.name)"
+          BOT_LOGIN="$(gh api user -q .login 2>/dev/null || echo '')"
+          echo "Default branch: $DEFAULT_BRANCH"
+          echo "Workflow identity (gate 9): ${BOT_LOGIN:-<unknown>}"
+
+          BLOCKING_LABELS=(needs:answer needs:human-merge blocker do-not-merge wip hold)
+          BOT_LABEL="needs:human-merge"
+
+          # A file counts as "doc" only if it clearly is one. Everything
+          # else - including anything we don't recognise - counts as code
+          # (gate 2, fail closed).
+          is_doc_file() {
+            local f="$1"
+            case "$f" in
+              src/*|*/src/*|packages/*|*/packages/*|scripts/*|*/scripts/*)
+                return 1 ;;
+            esac
+            case "$f" in
+              *.md|*.mdx|*.txt|*.example) return 0 ;;
+              docs/*) return 0 ;;
+              LICENSE|*/LICENSE|LICENSE.*|*/LICENSE.*) return 0 ;;
+              CHANGELOG|*/CHANGELOG|CHANGELOG.*|*/CHANGELOG.*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          # Recognised code / spec extensions and directories that always
+          # fail gate 2 outright, listed for the log message only (the
+          # is_doc_file fail-closed default already covers everything else).
+          is_known_code_file() {
+            local f="$1"
+            case "$f" in
+              src/*|*/src/*|packages/*|*/packages/*|scripts/*|*/scripts/*) return 0 ;;
+              *.ts|*.tsx|*.js|*.jsx|*.mjs|*.go|*.py|*.json|*.yaml|*.yml|*.toml|*.sql|*.sh|*.ps1) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          PRS_JSON="$(gh pr list --repo "$REPO" --state open --limit 100 \
+            --json number,title,author,isDraft,baseRefName,mergeable,mergeStateStatus,labels,additions,deletions,files)"
+
+          COUNT="$(echo "$PRS_JSON" | jq 'length')"
+          echo "Open PRs found: $COUNT"
+
+          echo "$PRS_JSON" | jq -c '.[]' | while IFS= read -r pr; do
+            NUM="$(echo "$pr" | jq -r '.number')"
+            TITLE="$(echo "$pr" | jq -r '.title')"
+            AUTHOR="$(echo "$pr" | jq -r '.author.login // ""')"
+            IS_DRAFT="$(echo "$pr" | jq -r '.isDraft')"
+            BASE="$(echo "$pr" | jq -r '.baseRefName')"
+            MERGEABLE="$(echo "$pr" | jq -r '.mergeable')"
+            MERGE_STATE="$(echo "$pr" | jq -r '.mergeStateStatus')"
+            ADDITIONS="$(echo "$pr" | jq -r '.additions')"
+            DELETIONS="$(echo "$pr" | jq -r '.deletions')"
+            TOTAL=$((ADDITIONS + DELETIONS))
+            LABEL_NAMES="$(echo "$pr" | jq -r '[.labels[].name] | join(",")')"
+
+            echo "----"
+            echo "PR #$NUM: \"$TITLE\" by $AUTHOR (base=$BASE, +$ADDITIONS/-$DELETIONS, draft=$IS_DRAFT, mergeable=$MERGEABLE/$MERGE_STATE)"
+
+            reason=""
+            simple=true
+
+            # Gate 1 - Conventional Commit type docs/chore only.
+            if ! [[ "$TITLE" =~ ^(docs|chore)(\([^\)]*\))?:[[:space:]] ]]; then
+              simple=false
+              reason="title is not a docs:/chore: Conventional Commit"
+            fi
+
+            # Gate 2 - changed files must all be documentation/config-doc.
+            if [ "$simple" = "true" ]; then
+              BAD_FILE=""
+              while IFS= read -r fpath; do
+                [ -z "$fpath" ] && continue
+                if ! is_doc_file "$fpath"; then
+                  BAD_FILE="$fpath"
+                  break
+                fi
+              done < <(echo "$pr" | jq -r '.files[].path')
+              if [ -n "$BAD_FILE" ]; then
+                simple=false
+                if is_known_code_file "$BAD_FILE"; then
+                  reason="touches a code/spec file ($BAD_FILE)"
+                else
+                  reason="touches a file of unclear type, treated as code ($BAD_FILE)"
+                fi
+              fi
+            fi
+
+            # Gate 3 - diff size <= 150 lines total.
+            if [ "$simple" = "true" ] && [ "$TOTAL" -gt 150 ]; then
+              simple=false
+              reason="diff is $TOTAL lines, over the 150-line limit"
+            fi
+
+            # Gate 4 - based on the repo's default branch (not stacked).
+            if [ "$simple" = "true" ] && [ "$BASE" != "$DEFAULT_BRANCH" ]; then
+              simple=false
+              reason="base is $BASE, not the default branch ($DEFAULT_BRANCH) - possibly stacked"
+            fi
+
+            if [ "$simple" != "true" ]; then
+              # Gates 1-4 classify the CHANGE itself. A "no" here means this
+              # was never going to be a trivial docs/chore PR regardless of
+              # its current CI/merge/draft state, so it gets a durable FLAG
+              # for a human - idempotent, skip if already labeled.
+              if echo ",$LABEL_NAMES," | grep -qF ",$BOT_LABEL,"; then
+                echo "FLAG #$NUM: $reason (already labeled $BOT_LABEL, nothing to do)"
+              else
+                echo "WOULD FLAG #$NUM $BOT_LABEL ($reason)"
+                if [ "$DRY_RUN" != "true" ]; then
+                  EXISTING_LABELS="$(gh label list --repo "$REPO" --json name -q '.[].name' 2>/dev/null || echo '')"
+                  if ! echo "$EXISTING_LABELS" | grep -qx "$BOT_LABEL"; then
+                    gh label create "$BOT_LABEL" --repo "$REPO" --color "5319e7" \
+                      --description "Not a simple docs/chore change - needs a human to merge" || true
+                  fi
+                  if gh pr edit "$NUM" --repo "$REPO" --add-label "$BOT_LABEL"; then
+                    echo "FLAGGED #$NUM ($reason)"
+                  else
+                    echo "::error::#$NUM could not add label $BOT_LABEL - needs a human look."
+                  fi
+                fi
+              fi
+              continue
+            fi
+
+            # From here the CHANGE qualifies as simple (gates 1-4). Gates
+            # 6, 7, 8, 5 and 9 below are about whether it is READY right
+            # now - a "no" here is a SKIP (log only, change nothing, try
+            # again next run), not a FLAG: nothing here is wrong with the
+            # PR itself, and adding a label would be noise for something
+            # that may well resolve on its own before the next run.
+
+            # Gate 7 - not a draft.
+            if [ "$IS_DRAFT" = "true" ]; then
+              echo "SKIP #$NUM (draft)"
+              continue
+            fi
+
+            # Gate 8 - no blocking label.
+            BLOCKED_BY=""
+            for bl in "${BLOCKING_LABELS[@]}"; do
+              if echo ",$LABEL_NAMES," | grep -qF ",$bl,"; then
+                BLOCKED_BY="$bl"
+                break
+              fi
+            done
+            if [ -n "$BLOCKED_BY" ]; then
+              echo "SKIP #$NUM (blocked by label \"$BLOCKED_BY\")"
+              continue
+            fi
+
+            # Gate 9 - the workflow's own identity did not open this PR
+            # (tripwire against a bot merging its own PR in one run).
+            if [ -n "$BOT_LOGIN" ] && [ "$AUTHOR" = "$BOT_LOGIN" ]; then
+              echo "SKIP #$NUM (opened by this workflow's own identity, $BOT_LOGIN - tripwire)"
+              continue
+            fi
+
+            # Gate 6 - mergeable, no conflicts.
+            if [ "$MERGEABLE" != "MERGEABLE" ] || { [ "$MERGE_STATE" != "CLEAN" ] && [ "$MERGE_STATE" != "HAS_HOOKS" ]; }; then
+              echo "SKIP #$NUM (mergeable=$MERGEABLE, mergeStateStatus=$MERGE_STATE - not clean yet)"
+              continue
+            fi
+
+            # Gate 5 - CI fully green (or no checks configured at all).
+            # `gh pr checks --json` buckets each check as one of pass /
+            # skipping / pending / fail / cancel. Green means every check is
+            # pass or skipping. Fail closed on anything else, including a
+            # bucket value not in this list: pending -> SKIP (incomplete),
+            # everything else (fail, cancel, unrecognised) -> SKIP (not
+            # green). A repo with no checks at all counts as green here
+            # because this point is only reached for a docs/chore PR.
+            CHECKS_JSON="$(gh pr checks "$NUM" --repo "$REPO" --json name,state,bucket 2>/dev/null || echo '[]')"
+            CHECK_COUNT="$(echo "$CHECKS_JSON" | jq 'length')"
+            if [ "$CHECK_COUNT" -gt 0 ]; then
+              NOT_GREEN="$(echo "$CHECKS_JSON" | jq '[.[] | select(.bucket!="pass" and .bucket!="skipping")] | length')"
+              if [ "$NOT_GREEN" -gt 0 ]; then
+                PENDING="$(echo "$CHECKS_JSON" | jq '[.[] | select(.bucket=="pending")] | length')"
+                if [ "$PENDING" -eq "$NOT_GREEN" ]; then
+                  echo "SKIP #$NUM (CI has $PENDING pending/queued check(s))"
+                else
+                  echo "SKIP #$NUM (CI is not green - $NOT_GREEN check(s) failing/cancelled/unrecognised)"
+                fi
+                continue
+              fi
+            fi
+            # No checks at all, or every check is success/neutral/skipped:
+            # green for a docs/chore PR.
+
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "WOULD MERGE #$NUM (squash + delete branch)"
+              continue
+            fi
+
+            echo "MERGING #$NUM"
+            if ! gh pr merge "$NUM" --repo "$REPO" --squash --delete-branch; then
+              echo "::error::#$NUM merge command failed - leaving as-is, needs a human look."
+              continue
+            fi
+
+            # Verify - a green "merged" step output can lie if the base was
+            # wrong or the merge silently no-op'd; check the actual state.
+            AFTER="$(gh pr view "$NUM" --repo "$REPO" --json state,mergeCommit 2>/dev/null || echo '{}')"
+            STATE_AFTER="$(echo "$AFTER" | jq -r '.state // empty')"
+            MERGE_COMMIT="$(echo "$AFTER" | jq -r '.mergeCommit.oid // empty')"
+            if [ "$STATE_AFTER" = "MERGED" ] && [ -n "$MERGE_COMMIT" ]; then
+              echo "MERGED #$NUM (commit $MERGE_COMMIT)"
+            else
+              echo "::error::#$NUM merge command ran but PR state is \"$STATE_AFTER\" with no merge commit - treating as unverified, needs a human look."
+            fi
+          done
+
+          echo "----"
+          echo "Done."
